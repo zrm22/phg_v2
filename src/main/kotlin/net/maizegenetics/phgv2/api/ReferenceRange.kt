@@ -1,5 +1,8 @@
 package net.maizegenetics.phgv2.api
 
+import com.google.common.collect.Range
+import net.maizegenetics.phgv2.utils.Position
+
 /**
  * A ReferenceRange is a contiguous region of a reference genome.
  * The region is defined by a contig, start and end position.
@@ -29,5 +32,9 @@ data class ReferenceRange(val contig: String, val start: Int, val end: Int) :
             val end = rangeString.substringAfter("-").toInt()
             return ReferenceRange(contig, start, end)
         }
+    }
+
+    fun toClosedGuavaRange(): Range<Position> {
+        return Range.closed(Position(contig,start), Position(contig,end))
     }
 }
