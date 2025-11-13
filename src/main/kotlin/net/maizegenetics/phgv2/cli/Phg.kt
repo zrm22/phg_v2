@@ -39,5 +39,6 @@ fun main(args: Array<String>) = Phg()
         CompositeToHaplotypeCoords(), // resequencing pipeline
         InitHvcfArray(), LoadHvcf(), QueryHvcfArrays(), // hvcf loading
         UpdateHvcfSpec(), // hvcf updating
+        BuildVariantIndex(),
     )
     .main(args)
