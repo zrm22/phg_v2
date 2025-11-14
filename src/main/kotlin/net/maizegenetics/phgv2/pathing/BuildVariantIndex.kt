@@ -1,16 +1,13 @@
 package net.maizegenetics.phgv2.pathing
 
-import biokotlin.util.GetVCFVariants
-import biokotlin.util.SimpleVariant
+import biokotlin.seq.NucSeq
+import biokotlin.seqIO.NucSeqIO
 import biokotlin.util.bufferedReader
-import biokotlin.util.getAllVCFFiles
-import biokotlin.util.validateVCFs
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.options.required
 import com.github.ajalt.clikt.parameters.types.int
-import com.google.common.collect.Range
 import com.google.common.collect.RangeMap
 import com.google.common.collect.TreeRangeMap
 import htsjdk.variant.variantcontext.Allele
@@ -23,21 +20,15 @@ import htsjdk.variant.variantcontext.writer.VariantContextWriter
 import htsjdk.variant.variantcontext.writer.VariantContextWriterBuilder
 import htsjdk.variant.vcf.VCFFileReader
 import htsjdk.variant.vcf.VCFHeaderLine
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.SendChannel
-import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import net.maizegenetics.phgv2.api.HaplotypeGraph
-import net.maizegenetics.phgv2.utils.AltHeaderMetaData
 import net.maizegenetics.phgv2.utils.Position
-import net.maizegenetics.phgv2.utils.VariantContextUtils
 import net.maizegenetics.phgv2.utils.createGenericHeader
 import org.apache.logging.log4j.LogManager
 import java.io.File
@@ -61,16 +52,22 @@ class BuildVariantIndex : CliktCommand(help="Build PHG Index from the Variants")
         .int()
         .default(5)
 
+    val tempDir by option(help = "The path to temporary files")
+        .default("")
+
     val outputFile by option(help = "Output file")
+        .required()
+
+    val referenceFile by option(help = "Path to local Reference FASTA file")
         .required()
 
 
     override fun run() {
         myLogger.info("Building Variant Index")
-        buildVariantIndex(dbPath, indexFile, gvcfPath, numThreads, outputFile)
+        buildVariantIndex(dbPath, indexFile, gvcfPath, numThreads, outputFile, tempDir, referenceFile)
     }
 
-    fun buildVariantIndex(dbPath: String, indexFile: String, gvcfPath: String, numThreads: Int = 5, outputFile:String) {
+    fun buildVariantIndex(dbPath: String, indexFile: String, gvcfPath: String, numThreads: Int = 5, outputFile:String, tempDir: String, referenceFile: String) {
         //Implement function to build the variant index from the tileDB
         //Build the phg mapping for SampleName + Position Map -> HaplotypeID
         //TODO uncomment this after we test speed.
@@ -78,16 +75,24 @@ class BuildVariantIndex : CliktCommand(help="Build PHG Index from the Variants")
 
         //Now we need to walk through the gvcf files and build a SNP list
 //        val variants = buildVariantSet(gvcfPath)
+
+        val gvcfFiles = File(gvcfPath).walkTopDown().filter{
+            it.isFile && (it.name.endsWith(".gvcf") || it.name.endsWith(".gvcf.gz") || it.name.endsWith("g.vcf") || it.name.endsWith(".g.vcf.gz"))
+        }.map { it.absolutePath }.toList()
+
         val variants = processAllGVCFsMultithread(
-            File(gvcfPath).walkTopDown().filter{
-                it.isFile && (it.name.endsWith(".gvcf") || it.name.endsWith(".gvcf.gz") || it.name.endsWith("g.vcf") || it.name.endsWith(".g.vcf.gz"))
-            }.map { it.absolutePath }.toList(),
+            gvcfFiles,
             numThreads
         )
 
         println("Total Variants Found: ${variants.size}")
+
+        val refSeqs = NucSeqIO(referenceFile).readAll()
         //Then we can do a 2nd pass through the gvcf files and build the index using those
-        buildMergedVariantContexts(variants, gvcfPath, outputFile)
+        convertGVCFsToVCFsMultithread(gvcfFiles, variants, refSeqs, tempDir, numThreads)
+//        buildMergedVariantContexts(variants, gvcfPath, outputFile)
+
+        TODO("Implement using bcftools to merge VCFs then delete the temporary ones.")
     }
 
     /**
@@ -229,16 +234,11 @@ class BuildVariantIndex : CliktCommand(help="Build PHG Index from the Variants")
 
             val variantPositions = mutableSetOf<Position>()
             myLogger.info("Processing file: $inputFile")
-            var counter = 0
             bufferedReader(inputFile).use { reader ->
 
                 val startTime = System.nanoTime()
                 var line = reader.readLine()
                 while(line != null) {
-//                    counter++
-//                    if(counter%10000 == 0) {
-//                        myLogger.info("Processed $counter lines in file: $inputFile")
-//                    }
                     //Metadata lines start with ##
                     if(line.startsWith("#")) {
                         line = reader.readLine()
@@ -258,7 +258,6 @@ class BuildVariantIndex : CliktCommand(help="Build PHG Index from the Variants")
                     //Check to see if it's a SNP
                     val isSNP = ref.length == 1 && alts.all { it.length == 1  }
                     if(isSNP) {
-//                        outputChannel.send(Position(contig, pos))
                         variantPositions.add(Position(contig, pos))
                     }
                     line = reader.readLine()
@@ -270,24 +269,221 @@ class BuildVariantIndex : CliktCommand(help="Build PHG Index from the Variants")
         }
     }
 
-//    suspend fun processPositions(positionChannel: Channel<Position>, variantSet: MutableSet<Position>) {
-//        for(position in positionChannel) {
-//            variantSet.add(position)
-//        }
-//    //        positionChannel.consumeEach { position ->
-////            variantSet.add(position)
-////        }
-//    }
-
     suspend fun processPositions(positionChannel: Channel<Set<Position>>, variantSet: MutableSet<Position>) {
         for(positions in positionChannel) {
             variantSet.addAll(positions)
         }
-        //        positionChannel.consumeEach { position ->
-//            variantSet.add(position)
-//        }
     }
 
+
+    fun convertGVCFsToVCFsMultithread(gvcfFiles : List<String>, positions: Set<Position>, refSeqs: Map<String,NucSeq>, outputDir: String, numThreads: Int) {
+        //Implement function to process all gvcf files in parallel
+        val inputFileChannel = Channel<String>(100)
+        val outputChannel = Channel<Pair<String,VariantContext>>(100)
+
+        val inputFileToOutputMap = mutableMapOf<String, VariantContextWriter>()
+
+        val sortedPositions = positions.sorted()
+
+
+        runBlocking {
+            for(inputFile in gvcfFiles) {
+                launch(Dispatchers.IO) {
+                    //Add each gvcf file to the processing queue
+                    inputFileChannel.send(inputFile)
+                }
+
+                val sampleNames = listOf(inputFile.replace(".gz","").replace(".gvcf","").replace(".g.vcf",""))
+
+                //get outputFileName
+                val outputFileName = getOutputFileName(inputFile)
+
+                val outputWriter = VariantContextWriterBuilder()
+                    .unsetOption(Options.INDEX_ON_THE_FLY)
+                    .setOutputFile(File("${outputDir}/${outputFileName}"))
+                    .setOutputFileType(VariantContextWriterBuilder.OutputType.VCF)
+                    .setOption(Options.ALLOW_MISSING_FIELDS_IN_HEADER)
+                    .build()
+
+                val header = createGenericHeader(sampleNames,emptySet<VCFHeaderLine>())
+
+                outputWriter.writeHeader(header)
+
+
+                inputFileToOutputMap[inputFile] = outputWriter
+            }
+            inputFileChannel.close()
+
+            val processGVCFsJobList: MutableList<Job> = mutableListOf()
+
+            repeat(numThreads) {
+                processGVCFsJobList.add(launch(Dispatchers.IO) {
+                    processSingleGVCFToVCFMultithread(inputFileChannel, outputChannel, sortedPositions, refSeqs)
+                })
+            }
+            //Launch a job to process the output channel
+
+            val processVariantOutputJob = launch(Dispatchers.Default) {
+                processVariantOutput(outputChannel, inputFileToOutputMap)
+            }
+
+            //Wait for all gvcf processing jobs to finish
+            processGVCFsJobList.joinAll()
+            outputChannel.close()
+            //Wait for the position processing job to finish
+            processVariantOutputJob.join()
+        }
+
+        //Close out the writers
+        for(outputWriters in inputFileToOutputMap.values) {
+            outputWriters.close()
+        }
+
+    }
+
+    fun getOutputFileName(file: String): String {
+        //need to strip off the .gz and either .gvcf or .g.vcf
+        val strippedName = file.replace(".gz","").replace(".gvcf","").replace(".g.vcf","")
+
+        return "${strippedName}.vcf.gz"
+    }
+
+    suspend fun processSingleGVCFToVCFMultithread(inputFileChannel: Channel<String>, outputChannel: SendChannel<Pair<String,VariantContext>>, positions: List<Position>, refSeqs: Map<String,NucSeq>) {
+        for(inputFile in inputFileChannel) {
+
+            myLogger.info("Processing file: $inputFile")
+            bufferedReader(inputFile).use { reader ->
+
+                val startTime = System.nanoTime()
+                var line = reader.readLine()
+                var currentPosIdx = 0
+                var sampleName = ""
+                while(line != null && currentPosIdx < positions.size) {
+                    //Metadata lines start with ##
+                    if(line.startsWith("#")) {
+                        if(line.startsWith("#CHROM")) {
+                            val stringParsed = line.split("\t")
+                            sampleName = stringParsed[9] //Assuming only one sample per gvcf
+                        }
+                        line = reader.readLine()
+                        continue
+                    }
+                    //otherwise it's a variant line.  We need to parse it down, check to see if its a SNP and then add it to the set
+                    val stringParsed = line.split("\t")
+                    val contig = stringParsed[0]
+                    val pos = stringParsed[1].toInt()
+                    val refAllele = stringParsed[3]
+                    val altAlleles = stringParsed[4].split(",").filter { it != "<NON_REF>" } //Alt can be multiple alleles
+
+                    val calledAltAllele = if(altAlleles.isNotEmpty()) altAlleles.first() else ""
+                    val currentSNPPos = positions[currentPosIdx]
+
+                    val actualRef = refSeqs[contig]?.get(currentSNPPos.position)?.toString() ?: ""
+
+
+                    //figure out if we have an END parameter
+                    //if there is not an END we check the length of the ref allele and add that to the pos to get the end but subtract 1
+                    val infoTags = stringParsed[7].split(";").filter { it.startsWith("END=") }
+
+                    val endPos = if(infoTags.isNotEmpty()) {
+                        infoTags[0].replace("END=","").toInt()
+                    } else {
+                        pos + refAllele.length - 1
+                    }
+
+
+                    val variantStartPosition = Position(contig, pos)
+                    val variantEndPosition = Position(contig, endPos)
+                    if(currentSNPPos in variantStartPosition .. variantEndPosition) {
+                        //We have a variant that overlaps the position
+                        val outputVariantContext = buildVariantContext(sampleName,contig,currentSNPPos, refAllele, calledAltAllele, actualRef)
+                        outputChannel.send(Pair(inputFile, outputVariantContext))
+                        //Only slide up the position because our variant might contain multiple output positions
+                        currentPosIdx++
+                        continue
+                    } else if(variantEndPosition < currentSNPPos) {
+                        //Advance the gvcf reader
+                        line = reader.readLine()
+                        continue
+                    } else {
+                        //Advance the position
+                        currentPosIdx++
+                        continue
+                    }
+
+
+
+
+//                    if(alts.isEmpty()) {
+//                        line = reader.readLine()
+//                        continue
+//                    }
+//                    //Check to see if it's a SNP
+//                    val isSNP = ref.length == 1 && alts.all { it.length == 1  }
+//                    if(isSNP) {
+//                        //Build VariantContext and send to output channel
+//                        //TODO implement
+//                    }
+//                    line = reader.readLine()
+                }
+
+                val endTime = System.nanoTime()
+                myLogger.info("Finished processing file: $inputFile in ${(endTime - startTime) / 1E9} seconds")
+            }
+        }
+    }
+
+    private fun buildVariantContext(
+        sampleName: String,
+        contig: String,
+        currentSNPPos: Position,
+        refAllele: String,
+        altAllele: String,
+        actualRef: String
+    ) : VariantContext {
+       val vcb = VariantContextBuilder()
+        vcb.chr(contig)
+        vcb.start(currentSNPPos.position.toLong())
+        vcb.stop(currentSNPPos.position.toLong())
+        val refAlleleObj = Allele.create(actualRef, true)
+
+        val genotypeBuilder = GenotypeBuilder()
+        genotypeBuilder.name(sampleName)
+
+        //check to see if we have a refBlock, an insertion, a deletion or a SNP
+        if(altAllele == "") {
+            //refBlock
+            genotypeBuilder.alleles(listOf(refAlleleObj, refAlleleObj))
+        } else if(refAllele.length < altAllele.length) {
+            //insertion
+            vcb.alleles(listOf(refAlleleObj, Allele.SV_SIMPLE_INS))
+            genotypeBuilder.alleles(listOf(Allele.SV_SIMPLE_INS, Allele.SV_SIMPLE_INS))
+        } else if(refAllele.length > altAllele.length) {
+            //deletion
+            vcb.alleles(listOf(refAlleleObj, Allele.SV_SIMPLE_DEL))
+            genotypeBuilder.alleles(listOf(Allele.SV_SIMPLE_DEL, Allele.SV_SIMPLE_DEL))
+        }
+        else if(refAllele.length == altAllele.length && refAllele.length>1) {
+            //Here we have a multi-allelic polymorphism setting to missing for now
+            vcb.alleles(listOf(refAlleleObj))
+            genotypeBuilder.alleles(listOf(Allele.NO_CALL, Allele.NO_CALL))
+        }
+        else {
+            //SNP
+            val altAlleleObj = Allele.create(altAllele, false)
+            vcb.alleles(listOf(refAlleleObj, altAlleleObj))
+            genotypeBuilder.alleles(listOf(refAlleleObj, altAlleleObj))
+        }
+        vcb.genotypes(genotypeBuilder.make())
+        return vcb.make()
+    }
+
+    suspend fun processVariantOutput(outputChannel: Channel<Pair<String,VariantContext>>, inputFileToOutputMap: Map<String, VariantContextWriter>) {
+        for((inputFile, variantContext) in outputChannel) {
+            val writer = inputFileToOutputMap[inputFile]
+            writer?.add(variantContext)
+        }
+    }
 
 
     //Now need a function to go through each position, get the snp value from the gvcf and build a merged Variant context to export
